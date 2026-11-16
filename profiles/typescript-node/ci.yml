@@ -1,0 +1,449 @@
+# Reference CI pipeline for the TypeScript/Node profile.
+# COPY & ADAPT: copy this file to your project's .github/workflows/ci.yml.
+# It is INERT here in the kit repo (GitHub only runs workflows under .github/workflows/).
+# Each quality gate carries a standardized `id: gate-*` that conformance/ci-gates.sh asserts.
+# Satisfies DEVELOPMENT-STANDARDS.md §14 (CI/CD Pipeline) incl. the conditional
+# container image supply-chain (gate-image-sbom + gate-image-provenance).
+#
+# HARDENING (do before production):
+#  - Pin every `uses:` to a full 40-char commit SHA (e.g. actions/checkout@<sha>  # v7.x).
+#    Note `anchore/sbom-action@v0` is a MAJOR-version float (highest-risk) — pin it first.
+#  - Pin tool installs to exact versions.
+#  - OIDC is least-privilege here: id-token:write / packages:write live only on the
+#    push-only provenance jobs, so PR-triggered steps cannot mint a token or push an
+#    image. Your cloud trust policy MUST restrict `sub` to
+#    `repo:<org>/<repo>:ref:refs/heads/main` (never `pull_request`).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The weekly run does NOT re-run the kit's own selftests: the aggregate below passes --kit-selftests-on-change, so a
+  # run with no changed-path listing (a first push, this cron, a push to another branch) skips them. A change
+  # that names a control-plane path still runs them in full (see the "Changed-path listing" step).
+  # It also carries this profile's ONLY all-branches secret sweep (the secret-scan step scans a PR's
+  # own commits and main's history, and every ref on a schedule): removing the schedule removes that
+  # sweep. Its cadence is yours to tune.
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    outputs:
+      has_dockerfile: ${{ steps.detect-dockerfile.outputs.has_dockerfile }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    # >>> kit:db-backed (incept removes for non-DB archetypes)
+    # The ts-node default archetype IS a DB-backed service (authed CRUD + a relational store), so
+    # Postgres ships ACTIVE: integration tests get a real database in CI (the profile's §6 testing
+    # guidance asserts DB state). NOTE: `npx prisma generate` MUST run before type-check/build (tsc
+    # needs the client) and `prisma migrate deploy` before tests — add those steps when you wire an
+    # ORM/schema (the minimal /healthz starter does not connect, so the idle service stays green).
+    # `sh scripts/incept.sh --no-db …` strips this whole delimited region AND deletes the
+    # scaffold/.db-backed marker, so a NON-DB archetype ships no idle database service.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: 'postgres://postgres:postgres@localhost:5432/app'
+    # <<< kit:db-backed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0   # full history so the secret scan sees all commits
+
+      # >>> kit:owned changed-listing
+      - name: Install pinned shellcheck v0.11.0 (sha256-verified; the runner image's 0.9.0 can run out of memory on the aggregate's lint)
+        run: sh scripts/install-shellcheck.sh "$RUNNER_TEMP/sc" && echo "$RUNNER_TEMP/sc" >> "$GITHUB_PATH"
+      - name: Shellcheck is the pinned v0.11.0 (fail loudly if not)
+        run: sh scripts/install-shellcheck.sh --check
+      - name: Clear the changed-path listing (nothing an earlier step wrote may survive to the verify step)
+        run: echo "KIT_CHANGED=" >> "$GITHUB_ENV"
+
+      - name: Changed-path listing (default-branch pull request or push)
+        # ADOPTER-KIT-SELFTESTS-ON-CHANGE: write the run's changed paths so verify.sh can skip the kit's own
+        # selftests when none of them is a control-plane path. A pull request into the default branch lists
+        # BASE...HEAD; a push to the default branch lists the TWO-dot BEFORE..SHA (two trees, so a force-push
+        # over-lists, the safe direction). Both shas are ENV-BOUND, never interpolated into the script, and
+        # must be 40 or 64 hex. The all-zero before of a first push writes no listing and exits here, so that run skips
+        # the kit's own selftests (--kit-selftests-on-change). Past that check, a bad sha, a failed diff, an empty diff or a
+        # path containing a newline writes the one-line listing `.github/kit-listing-refused`, which verify's literal floor
+        # reads as a control-plane path: that run is FULL. A schedule run or any other event gets no listing and skips them.
+        # Default branch only (security S2): a PR into another base branch, or a push to another branch, gets no listing,
+        # so it skips them too. The clear step above empties KIT_CHANGED, so nothing an earlier step wrote can survive.
+        if: (github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          z="$RUNNER_TEMP/kit-changed.z"
+          refuse() { printf '%s\n' '.github/kit-listing-refused' > "$RUNNER_TEMP/kit-changed.txt" && echo "KIT_CHANGED=$RUNNER_TEMP/kit-changed.txt" >> "$GITHUB_ENV" && exit 0; exit 1; }
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base="$BASE_SHA"; range="$BASE_SHA...HEAD" ;;
+            push) base="$BEFORE_SHA"; range="$BEFORE_SHA..$GITHUB_SHA" ;;
+            *) exit 0 ;;
+          esac
+          case "$base" in *[!0]*|'') : ;; *) exit 0 ;; esac
+          case "$base" in *[!0-9a-f]*|'') refuse ;; esac
+          [ "${#base}" -eq 40 ] || [ "${#base}" -eq 64 ] || refuse
+          if git diff -z --name-only --no-renames "$range" > "$z" \
+            && [ -s "$z" ] && [ "$(tr -cd '\n' < "$z" | wc -c)" -eq 0 ]; then
+            tr '\0' '\n' < "$z" > "$RUNNER_TEMP/kit-changed.txt"
+            echo "KIT_CHANGED=$RUNNER_TEMP/kit-changed.txt" >> "$GITHUB_ENV"
+          else
+            refuse
+          fi
+
+      - name: Conformance aggregate (required — DEVELOPMENT-STANDARDS.md §14)
+        # No `gate-*` id: this is the aggregate, not one of the eight §14 gate ids
+        # that conformance/ci-gates.sh REQUIREs. Blocks on the CONTROL battery — `[doc]` failures
+        # exit 0 by design (verify.sh's RESULT lines), so a day-one adopter is not blocked by an
+        # unwritten RPO/RTO. Placed before toolchain setup because the aggregate is POSIX sh with
+        # no toolchain dependency; identical placement across every emitted pipeline is what makes
+        # `conformance/verify-enforced-wired.sh --fleet` cheap to lock.
+        # KIT_CHANGED is set only by the listing step above (a default-branch pull request or push); empty on
+        # a schedule or any unknown. --kit-selftests-on-change makes a run with no listing skip the kit's own
+        # selftests (rows N-A, one notice); a listing that names a control-plane path still runs them all.
+        # Keep this ONE line (verify-enforced-wired reads it).
+        run: sh conformance/verify.sh --require --kit-selftests-on-change ${KIT_CHANGED:+--changed "$KIT_CHANGED" --summary-file "$GITHUB_STEP_SUMMARY"}
+      # <<< kit:owned changed-listing
+
+      # HITL obligation — the threat-model gate runs HERE, in PR context, NOT inside verify.sh --require.
+      # WHY IT IS NOT IN THE AGGREGATE ABOVE: conformance/threat-obligation.sh is diff-relative — it derives
+      # its change-set from `merge-base HEAD origin/main` and fails CLOSED when no base resolves. verify.sh
+      # --require must stay green on any tree regardless of git-fetch depth (a shallow checkout or a fresh
+      # clone), so the diff-relative gate belongs in a PR-context step with a resolvable base, not the
+      # offline aggregate. This mirrors the kit's own ci.yml (the `threat-obligation` job) and its
+      # promotion-readiness gate, which likewise run diff-relative logic only in PR context.
+      # COPY-AND-ADAPT (reference, not a tier): this step is the pattern adopters copy into their pipeline.
+      # It needs the `fetch-depth: 0` checkout above so `origin/main` resolves; on a non-PR event main IS
+      # the base, so it is gated to pull_request.
+      # WHAT MAKES IT RED — BOTH HALVES, because the regulated half is the one an adopter will not expect:
+      #  - SENSITIVE (HITL-1): any path containing secret / auth / password / payment, anything under
+      #    migrations/, any .env file.
+      #  - REGULATED DATA (HITL-5): pii · gdpr · patient · cardholder · phi · ssn · personal-data, matched
+      #    case-insensitively (src/PHI_export.ts and data/PATIENT_EXPORT.csv both trigger), with phi/ssn
+      #    segment-anchored (/phi/, phi_, _phi, -phi) so a bare `graphics.py` does not.
+      # THE REGULATED HALF IS DELIBERATELY DECLARATION-INDEPENDENT: it fires on a project whose data
+      # classification is `Internal`, or absent entirely, because the whole point is that a PR can
+      # INTRODUCE PII handling before anyone updates the declaration. If you hit this red without having
+      # declared anything, that is the gate working — write the record, or narrow the surface knowingly.
+      # The project-level, declaration-triggered obligation is a DIFFERENT gate (conformance/readiness.sh privacy-ready);
+      # the two compose. `sparkwright explain threat-model` prints the full surface and its known misses.
+      # A PR touching either half with no filled THREAT-MODEL.md FAILs the build; any other PR is N/A and passes.
+      - name: Threat-model obligation (PR-context; sensitive/regulated-data surface requires a filled THREAT-MODEL)
+        if: github.event_name == 'pull_request'
+        run: sh conformance/threat-obligation.sh
+
+      # HITL obligation — the UAT-signoff gate runs HERE too, in PR context, for the same reason as the
+      # threat-model gate above: conformance/uat-obligation.sh is diff-relative (merge-base HEAD origin/main)
+      # and fails CLOSED with no resolvable base, so it belongs in a PR-context step with the fetch-depth: 0
+      # checkout, not the offline verify.sh --require aggregate. COPY-AND-ADAPT (reference, not a tier).
+      # WHAT MAKES IT RED: the user-facing TASTE surface — the components/views/pages/screens/ui/frontend/
+      # styles directories, at repo ROOT or nested (both forms are listed; `*/x/*` alone would miss the
+      # Next.js and Vite default layout), plus the UI and view-template markup extensions listed in the
+      # check's UAT_SURFACE_GLOBS (.tsx/.jsx/.vue/.svelte/.css/.scss/.less and the template engines).
+      # NOTE a bare `templates/` DIRECTORY is deliberately NOT a trigger — it fires on Helm/CloudFormation/
+      # cookiecutter manifests, not UI — and `.html`/`.htm` are deliberately NOT listed here either: a raw
+      # .html edit is an ACCESSIBILITY surface (see the a11y step below, which does list them) but not
+      # necessarily a change of TASTE. `sparkwright explain uat` prints the full surface and its known misses.
+      # A PR touching that surface with no filled UAT-SIGNOFF.md FAILs the build; any other PR is N/A and passes.
+      - name: UAT-signoff obligation (PR-context; user-facing taste surface requires a filled UAT-SIGNOFF)
+        if: github.event_name == 'pull_request'
+        run: sh conformance/uat-obligation.sh
+
+      # HITL obligation — the a11y sign-off gate runs HERE too, in PR context, for the same reason as the two
+      # gates above: conformance/a11y-obligation.sh is diff-relative (merge-base HEAD origin/main) and fails
+      # CLOSED with no resolvable base, so it belongs in a PR-context step with the fetch-depth: 0 checkout,
+      # not the offline verify.sh --require aggregate. COPY-AND-ADAPT (reference, not a tier).
+      # A PR touching a user-facing UI surface — the components/views/pages/screens/ui/frontend/styles
+      # directories (repo-root or nested), plus the UI and view-template markup extensions listed in the
+      # check's A11Y_SURFACE_GLOBS (.tsx/.jsx/.vue/.svelte/.css/.scss/.less/.html and the template engines) —
+      # with no filled A11Y-SIGNOFF.md at the repo root FAILs the build; any other PR is N/A and passes.
+      # This is the enforcement behind the Definition-of-Done Accessibility item. Note it deliberately does
+      # NOT gate a bare templates/ directory: that fires on Helm/CloudFormation manifests, not UI.
+      - name: A11y sign-off obligation (PR-context; user-facing UI requires a filled A11Y-SIGNOFF)
+        if: github.event_name == 'pull_request'
+        run: sh conformance/a11y-obligation.sh
+
+      - name: Detect Dockerfile (drives the push-only image-provenance gate; G1)
+        id: detect-dockerfile
+        run: |
+          if [ -f Dockerfile ]; then echo "has_dockerfile=true"; else echo "has_dockerfile=false"; fi >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        id: gate-install
+        run: npm ci
+
+      - name: Lint
+        id: gate-lint
+        run: npm run lint
+
+      - name: Type-check
+        id: gate-type-check
+        run: npm run type-check
+
+      - name: Test + coverage (>=80%)
+        id: gate-test
+        run: npm run test:coverage   # vitest --coverage; thresholds enforced in vitest.config.ts
+
+      - name: AI eval gate (conditional — runs only if an evals/ dir is present)
+        id: gate-eval
+        run: |
+          if [ -d evals ]; then
+            npm run eval   # define an "eval" script that scores against a rubric and exits non-zero below threshold
+          else
+            echo "no evals/ dir — skipping the eval gate (add one when your feature uses a model; see profiles/ml/evals for a reference)"
+          fi
+
+      - name: Build
+        id: gate-build
+        run: npm run build
+
+      - name: Secret scan
+        id: gate-secret-scan
+        # History scan via the pinned gitleaks binary (checksum-verified; H4b supply-chain pattern).
+        # Replaces gitleaks-action's commit-range mode, which failed on PR merge-refs ("Invalid
+        # revision range") and needed pull-requests:read; `gitleaks git` makes no API call
+        # (least-privilege: contents:read suffices) and respects .gitignore. Pinned v8.24.3 + sha256
+        # (gitleaks_8.24.3_checksums.txt).
+        # SCOPE: a pull request scans its own commits (base..head); a push to main scans main's own
+        # history; any other event (the weekly schedule, workflow_dispatch) scans every ref. The
+        # schedule is therefore your only all-branches sweep: removing it removes that sweep. Without
+        # --log-opts gitleaks runs `git log --all`, so one branch's finding would red every PR.
+        # Never put --all inside a PR range (it cancels the range). Event fields enter only via env:.
+        # OTHER FORGES: scan <target-tip>..<source-head> on change requests, the default branch's HEAD
+        # on default-branch pushes, and all refs on a schedule, from a full-depth clone. GitLab:
+        # GIT_DEPTH 0 and $CI_MERGE_REQUEST_DIFF_BASE_SHA..$CI_COMMIT_SHA (the shipped GitLab variant, profiles/typescript-node/ci.gitlab-ci.yml, still scans every branch; tracked separately). Elsewhere:
+        # `git merge-base origin/<target> HEAD` gives the left side of the range.
+        # SECRET-GATE SCOPE: the commits in that range are scanned in full (fetch-depth: 0 above puts
+        # them all in the checkout). The only thing out of scope is generated build output (dist/,
+        # coverage/) — and it is out of scope because it is `.gitignore`d (see scaffold/.gitignore),
+        # which `gitleaks git` respects. No allowlist file is used or needed: gitleaks'
+        # `.gitleaksignore` holds finding FINGERPRINTS (commit:file:rule:line), NOT path globs, so a
+        # path-glob allowlist would be inert (rejected with a warning). Source, env files, and configs
+        # are never excluded — they stay fully in scope.
+        env:
+          GL_EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          GL_VER=8.24.3
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          case "$GL_EVENT" in
+            pull_request) GL_SCOPE="$BASE_SHA..HEAD" ;;
+            push)         GL_SCOPE="HEAD" ;;
+            *)            GL_SCOPE="--full-history --all" ;;
+          esac
+          if [ "$GL_EVENT" = pull_request ]; then
+            { echo "$BASE_SHA" | grep -Eqx '[0-9a-f]{40}([0-9a-f]{24})?' \
+              && git rev-parse -q --verify "$BASE_SHA^{commit}" >/dev/null; } \
+              || { echo "secret-scan: PR range not resolvable in this checkout; refusing to guess a range"; exit 1; }
+            [ -n "$(git rev-list -n 1 "$BASE_SHA..HEAD")" ] \
+              || { echo "secret-scan: PR range is empty; refusing to report a scan of nothing"; exit 1; }
+          fi
+          # shellcheck disable=SC2086  # deliberate: the all-refs scope is TWO words and must split for rev-list.
+          echo "secret-scan scope ($GL_EVENT): $GL_SCOPE ($(git rev-list --count $GL_SCOPE 2>/dev/null || echo '?') commits)"
+          /tmp/gitleaks git . --no-banner --redact --log-opts="$GL_SCOPE"
+
+      - name: Dependency vulnerability scan
+        id: gate-dep-scan
+        run: npm audit --omit=dev --audit-level=high   # prod-dep posture; triage dev-tool advisories separately (they don't ship)
+
+      - name: Dependency advisories — full tree (report-only, non-enforcing)
+        # Visibility, NOT a gate: surfaces dev/build-time advisories that gate-dep-scan
+        # (--omit=dev) excludes. Never promote to a required gate — see CP7R5-K4.
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Generate SBOM (CycloneDX)
+        id: gate-sbom
+        # Version-pinned like every action SHA in this file: an unpinned `npx` fetches and EXECUTES
+        # whatever the registry serves at run time, which is a supply-chain surface the rest of this
+        # workflow deliberately closes.
+        run: npx --yes @cyclonedx/cyclonedx-npm@6.0.0 --output-format JSON --output-file sbom.json
+
+      - name: SAST (Semgrep)
+        id: gate-sast
+        # `run:` (not a marketplace action) — nothing to SHA-pin, satisfies action-pinning.sh.
+        # `--error` makes findings fail the gate; tune `--config` to a pinned ruleset for prod.
+        # SAST SCOPE — EXCLUSION-scoping (deliberate, security reason): scan the WHOLE app by default
+        # (`--error .`) and opt OUT of only genuinely-noisy generated/vendored paths via the committed
+        # `.semgrepignore` (dist/, coverage/, node_modules/ — see scaffold/.semgrepignore). This is the
+        # secure default: a new code root you add later (app/, server/, lib/, pages/) stays covered
+        # automatically — the previous src/-only INCLUSION scope would have SILENTLY dropped SAST on any
+        # code outside src/. Never trade whole-app coverage for a single-dir scope. Keep `--config
+        # p/default` (a pinned ruleset); never `--config auto` (auto resolves a different registry
+        # ruleset per environment = a flaky required gate).
+        run: pipx run semgrep==1.182.1 --config p/default --error .
+
+      - name: License policy (over the SBOM)
+        id: gate-license
+        run: sh scripts/license-check.sh --sbom sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Emit agent-ops trace (agentops sensor)
+        id: gate-agent-trace
+        # Emits one OTel-shaped agent-ops span for this CI run (the agentops-sensor path): runs the
+        # shipped scripts/otel-trace.sh sensor when present, else a minimal inline NDJSON span — so an
+        # adopter that has not wired the sensor still passes (no missing-script RED). This step
+        # OBSERVES; it never narrows any gate.
+        #
+        # CP-7 K9: this step used to call `otel-trace.sh --emit`, which the sensor's dispatch does not
+        # provide (it offers new-trace | span | --selftest), so it exited 2 on EVERY adopter's first CI
+        # run — while carrying a comment claiming it was green by construction. Only the `else` branch
+        # had ever been reasoned about; the `if` branch is the one that always runs in production.
+        # conformance/ci-gates.sh now resolves this invocation statically, and the golden-path job
+        # EXECUTES this chain against a real incepted vehicle. Do not reintroduce an unsupported verb.
+        run: |
+          if [ -f scripts/otel-trace.sh ]; then
+            tid=$(sh scripts/otel-trace.sh new-trace)
+            sh scripts/otel-trace.sh span --trace "$tid" --name agentops.ci --status OK \
+              --attr "ci.run_id=${GITHUB_RUN_ID:-local}"
+          else
+            printf '{"name":"agentops.ci","status":{"code":"OK"}}\n'
+          fi
+
+      # --- conditional container image supply-chain (service profile) ---
+      # Builds the image and scans it on EVERY PR (real scan-before-merge); no push here.
+      # NOTE: this PR-time build and the push-only `image-provenance` build are independent,
+      # so the scanned digest is not guaranteed identical to the attested digest. Least-
+      # privilege forbids the PR job from pushing, so a single shared build can't span both.
+      # For production, make SBOM and provenance cover identical bits: e.g. in image-provenance,
+      # also generate an SBOM of the pushed digest (Syft against ghcr.io/...@<digest>) and
+      # attest it alongside provenance — so the release SBOM matches the attested image.
+      - name: Build container image (local, for SBOM scan)
+        if: ${{ hashFiles('Dockerfile') != '' }}   # skips until you adapt the profile's COPY-&-ADAPT Dockerfile into the repo
+        run: docker build -t ts-node-app:ci .
+
+      - name: Generate image SBOM (Syft, CycloneDX)
+        if: ${{ hashFiles('Dockerfile') != '' }}   # skips until you adapt the profile's COPY-&-ADAPT Dockerfile into the repo
+        id: gate-image-sbom
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
+        with:
+          image: ts-node-app:ci
+          format: cyclonedx-json
+          output-file: image-sbom.json
+
+      - name: Image vulnerability scan (fixable CRITICAL/HIGH)
+        if: ${{ hashFiles('Dockerfile') != '' }}   # skips until you adapt the profile's COPY-&-ADAPT Dockerfile into the repo
+        id: gate-image-vuln
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ts-node-app:ci
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          exit-code: '1'
+
+      - name: Upload image SBOM
+        if: ${{ hashFiles('Dockerfile') != '' }}   # skips until you adapt the profile's COPY-&-ADAPT Dockerfile into the repo
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: image-sbom
+          path: image-sbom.json
+
+      - name: Upload build artifact (for provenance)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: build-artifact
+          path: dist/**           # the real build output (npm run build)
+          if-no-files-found: error
+
+      # Attestation needs a public repository or GitHub Enterprise Cloud: say so when the provenance job below skips.
+      - name: Build provenance skipped (notice)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.repository.private != false && vars.KIT_ATTEST_PRIVATE != 'true'
+        run: |
+          echo "::notice::Build provenance skipped: attestations on a private repository need GitHub Enterprise Cloud; set KIT_ATTEST_PRIVATE once you have it"
+
+  # NOTE (provenance precondition): GitHub offers artifact attestations on PUBLIC repositories, and on private
+  # or internal ones only with GitHub Enterprise Cloud, so the attest step is gated to run only where it can
+  # pass — otherwise `main` would go red on first merge with no in-repo explanation. To enable it: make the
+  # repo public, or, if you have Enterprise Cloud, set the KIT_ATTEST_PRIVATE variable to true (a repository
+  # or organization variable). This is a SKIP-WITH-REASON, not a silent disable: the job still runs (and
+  # attests) wherever the precondition holds, and a notice names the cause wherever it is skipped. Where the
+  # gate does not apply to you, record a dated `na` for gate-provenance in conformance/gate-dispositions.txt.
+  provenance:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && (github.event.repository.private == false || vars.KIT_ATTEST_PRIVATE == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write       # scoped to this push-only job (build-provenance attestation)
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: build-artifact
+          path: build-artifact
+      - name: Attest build provenance
+        id: gate-provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018  # v1
+        with:
+          subject-path: build-artifact/**
+
+  image-provenance:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci.outputs.has_dockerfile == 'true' && (github.event.repository.private == false || github.event.repository.owner.type == 'Organization')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write       # push image to GHCR (scoped to this push-only job)
+      id-token: write       # OIDC for digest-bound attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute lowercase image name
+        id: image
+        # GHCR stores image paths lowercase; github.repository may be mixed-case
+        # (e.g. your-org/App). A mixed-case subject-name breaks attestation verification.
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Build and push image
+        id: build-push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+      # The image push above needs no Enterprise Cloud; only the attestation does (public, or KIT_ATTEST_PRIVATE).
+      - name: Image provenance skipped (notice)
+        if: github.event.repository.private != false && vars.KIT_ATTEST_PRIVATE != 'true'
+        run: |
+          echo "::notice::Image provenance skipped: attestations on a private repository need GitHub Enterprise Cloud; set KIT_ATTEST_PRIVATE once you have it"
+      - name: Attest image provenance (digest-bound)
+        id: gate-image-provenance
+        if: github.event.repository.private == false || vars.KIT_ATTEST_PRIVATE == 'true'
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018  # v1
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: true
